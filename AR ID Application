@@ -1,0 +1,282 @@
+import SwiftUI
+import AVFoundation
+import Vision
+import CoreML
+import UIKit
+
+// MARK: - App Entry
+
+@main
+struct SpatialRecallARApp: App {
+    var body: some Scene {
+        WindowGroup {
+            SpatialRecallARView()
+        }
+    }
+}
+
+// MARK: - Main View
+
+struct SpatialRecallARView: View {
+
+    @StateObject private var camera = CameraService()
+    @State private var capturedImage: UIImage?
+    @State private var detections: [DetectedObject] = []
+    @State private var status: String = "Ready"
+
+    var body: some View {
+        NavigationView {
+            VStack(spacing: 12) {
+
+                ZStack {
+                    CameraPreview(session: camera.session)
+                        .onAppear { camera.start() }
+                        .onDisappear { camera.stop() }
+
+                    if let img = capturedImage {
+                        Image(uiImage: img)
+                            .resizable()
+                            .scaledToFit()
+                    }
+
+                    DetectionOverlay(detections: detections)
+                }
+                .frame(height: 420)
+                .clipShape(RoundedRectangle(cornerRadius: 16))
+
+                HStack(spacing: 12) {
+                    Button("Capture Photo") {
+                        camera.capture { result in
+                            switch result {
+                            case .success(let image):
+                                capturedImage = image
+                                detections = []
+                                status = "Photo captured"
+                            case .failure(let err):
+                                status = err.localizedDescription
+                            }
+                        }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(!camera.ready)
+
+                    Button("Detect Objects") {
+                        Task { await runDetection() }
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(capturedImage == nil)
+                }
+
+                Text(status)
+                    .font(.headline)
+
+                ScrollView {
+                    VStack(alignment: .leading) {
+                        ForEach(detections) { d in
+                            HStack {
+                                Text(d.label)
+                                Spacer()
+                                Text("\(Int(d.confidence * 100))%")
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                }
+                .frame(maxHeight: 150)
+
+                Spacer()
+            }
+            .padding()
+            .navigationTitle("Spatial Recall AR")
+        }
+    }
+
+    // MARK: - Detection Logic
+
+    @MainActor
+    private func runDetection() async {
+        guard let image = capturedImage else { return }
+
+        do {
+            status = "Running object detection…"
+            let detector = try ObjectDetector()
+            let results = try await detector.detect(image)
+            detections = results.sorted { $0.confidence > $1.confidence }
+            status = "Detected \(detections.count) objects"
+        } catch {
+            status = error.localizedDescription
+        }
+    }
+}
+
+// MARK: - Camera Service
+
+final class CameraService: NSObject, ObservableObject {
+
+    let session = AVCaptureSession()
+    private let output = AVCapturePhotoOutput()
+    private let queue = DispatchQueue(label: "camera.queue")
+    private var completion: ((Result<UIImage, Error>) -> Void)?
+
+    @Published var ready: Bool = false
+
+    override init() {
+        super.init()
+        configure()
+    }
+
+    private func configure() {
+        queue.async {
+            self.session.beginConfiguration()
+            self.session.sessionPreset = .photo
+
+            guard let device = AVCaptureDevice.default(for: .video),
+                  let input = try? AVCaptureDeviceInput(device: device)
+            else { return }
+
+            if self.session.canAddInput(input) {
+                self.session.addInput(input)
+            }
+
+            if self.session.canAddOutput(self.output) {
+                self.session.addOutput(self.output)
+            }
+
+            self.session.commitConfiguration()
+            DispatchQueue.main.async { self.ready = true }
+        }
+    }
+
+    func start() {
+        AVCaptureDevice.requestAccess(for: .video) { granted in
+            if granted {
+                self.queue.async { self.session.startRunning() }
+            }
+        }
+    }
+
+    func stop() {
+        queue.async { self.session.stopRunning() }
+    }
+
+    func capture(completion: @escaping (Result<UIImage, Error>) -> Void) {
+        queue.async {
+            self.completion = completion
+            self.output.capturePhoto(with: AVCapturePhotoSettings(), delegate: self)
+        }
+    }
+}
+
+extension CameraService: AVCapturePhotoCaptureDelegate {
+    func photoOutput(_ output: AVCapturePhotoOutput,
+                     didFinishProcessingPhoto photo: AVCapturePhoto,
+                     error: Error?) {
+
+        if let error {
+            completion?(.failure(error))
+            return
+        }
+
+        guard let data = photo.fileDataRepresentation(),
+              let img = UIImage(data: data) else {
+            completion?(.failure(NSError(domain: "camera", code: -1)))
+            return
+        }
+
+        completion?(.success(img))
+    }
+}
+
+// MARK: - Camera Preview
+
+struct CameraPreview: UIViewRepresentable {
+    let session: AVCaptureSession
+
+    func makeUIView(context: Context) -> UIView {
+        let view = UIView()
+        let layer = AVCaptureVideoPreviewLayer(session: session)
+        layer.videoGravity = .resizeAspectFill
+        view.layer.addSublayer(layer)
+        layer.frame = UIScreen.main.bounds
+        return view
+    }
+
+    func updateUIView(_ uiView: UIView, context: Context) {}
+}
+
+// MARK: - Object Detection
+
+struct DetectedObject: Identifiable {
+    let id = UUID()
+    let label: String
+    let confidence: Float
+    let bbox: CGRect
+}
+
+final class ObjectDetector {
+
+    private let model: VNCoreMLModel
+
+    init() throws {
+        // 🔁 CHANGE MODEL NAME IF NEEDED
+        let mlModel = try YOLOv8n(configuration: MLModelConfiguration()).model
+        self.model = try VNCoreMLModel(for: mlModel)
+    }
+
+    func detect(_ image: UIImage) async throws -> [DetectedObject] {
+        guard let cg = image.cgImage else { return [] }
+
+        return try await withCheckedThrowingContinuation { cont in
+            let request = VNCoreMLRequest(model: model) { req, err in
+                if let err { cont.resume(throwing: err); return }
+
+                let results = (req.results as? [VNRecognizedObjectObservation]) ?? []
+                let objects = results.map {
+                    DetectedObject(
+                        label: $0.labels.first?.identifier ?? "Unknown",
+                        confidence: $0.labels.first?.confidence ?? 0,
+                        bbox: $0.boundingBox
+                    )
+                }
+                cont.resume(returning: objects)
+            }
+
+            let handler = VNImageRequestHandler(cgImage: cg)
+            DispatchQueue.global().async {
+                try? handler.perform([request])
+            }
+        }
+    }
+}
+
+// MARK: - Overlay View
+
+struct DetectionOverlay: View {
+    let detections: [DetectedObject]
+
+    var body: some View {
+        GeometryReader { geo in
+            ForEach(detections) { d in
+                let r = convert(d.bbox, size: geo.size)
+                RoundedRectangle(cornerRadius: 6)
+                    .stroke(.red, lineWidth: 2)
+                    .frame(width: r.width, height: r.height)
+                    .position(x: r.midX, y: r.midY)
+
+                Text("\(d.label)")
+                    .font(.caption2)
+                    .padding(4)
+                    .background(.ultraThinMaterial)
+                    .position(x: r.minX + 40, y: r.minY - 10)
+            }
+        }
+    }
+
+    private func convert(_ bbox: CGRect, size: CGSize) -> CGRect {
+        let x = bbox.origin.x * size.width
+        let y = (1 - bbox.origin.y - bbox.height) * size.height
+        let w = bbox.width * size.width
+        let h = bbox.height * size.height
+        return CGRect(x: x, y: y, width: w, height: h)
+    }
+}
